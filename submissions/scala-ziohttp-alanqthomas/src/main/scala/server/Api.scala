@@ -142,8 +142,9 @@ object Api:
 
   /** `String.prototype.trim()`: JavaScript's WhiteSpace and LineTerminator characters. */
   private def isJsSpace(c: Char): Boolean =
-    c == ' ' || (c >= '\t' && c <= '\r') || c == ' ' || c == ' ' || (c >= ' ' && c <= ' ') ||
-      c == ' ' || c == ' ' || c == ' ' || c == ' ' || c == '　' || c == '﻿'
+    // Escapes, not literal characters: editors strip U+2028/U+2029 as "unusual line terminators".
+    c == ' ' || (c >= '\t' && c <= '\r') || c == '\u00a0' || c == '\u1680' || (c >= '\u2000' && c <= '\u200a') ||
+      c == '\u2028' || c == '\u2029' || c == '\u202f' || c == '\u205f' || c == '\u3000' || c == '\ufeff'
 
   def trimJs(s: String): String =
     var start = 0

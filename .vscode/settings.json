@@ -1,0 +1,7 @@
+{
+	"files.watcherExclude": {
+		"**/target/**": true
+	},
+	"metals.customProjectRoot": "submissions/scala-ziohttp-alanqthomas",
+	"metals.javaHome": "/opt/temurin-27"
+}
