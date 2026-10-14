@@ -14,7 +14,8 @@ lazy val root = (project in file("."))
       // zio-http declares Netty's io_uring transport optional; Main prefers it when the kernel supports it.
       "io.netty"   % "netty-transport-native-io_uring" % nettyVersion classifier "linux-x86_64",
     ),
-    // zio-http 3.11.6 was built against Netty 4.2.18; take the latest patch release.
+    // zio-http 3.11.6 was built against ZIO 2.1.26 and Netty 4.2.18; keep every module on the latest patch release.
+    dependencyOverrides += "dev.zio" %% "zio-streams" % "2.1.27",
     dependencyOverrides ++= Seq(
       "netty-buffer", "netty-codec-base", "netty-codec-compression", "netty-codec-http", "netty-codec-http2",
       "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy", "netty-resolver",

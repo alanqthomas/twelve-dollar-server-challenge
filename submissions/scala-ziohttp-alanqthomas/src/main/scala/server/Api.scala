@@ -52,11 +52,13 @@ final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
       if body == null then PostNotFound else json(Status.Ok, body)
 
   private def createPost(req: Request): UIO[Response] =
-    jwt.authenticate(authorization(req)) match
-      case Auth.User(userId, username) =>
-        // An aggregated body is already in memory: `asArray` is a completed Exit, so this stays synchronous.
-        req.body.asArray.foldCause(_ => MalformedJson, bytes => guarded(createPost(userId, username, bytes)))
-      case failure                     => Exit.succeed(authError(failure))
+    try
+      jwt.authenticate(authorization(req)) match
+        case Auth.User(userId, username) =>
+          // An aggregated body is already in memory: `asArray` is a completed Exit, so this stays synchronous.
+          req.body.asArray.foldCause(_ => MalformedJson, bytes => guarded(createPost(userId, username, bytes)))
+        case failure                     => Exit.succeed(authError(failure))
+    catch case NonFatal(_) => Exit.succeed(Internal)
 
   private def createPost(userId: Long, username: String, bytes: Array[Byte]): Response =
     Json.decoder.decodeJson(new String(bytes, UTF_8)) match
