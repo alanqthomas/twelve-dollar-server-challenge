@@ -11,6 +11,8 @@ lazy val root = (project in file("."))
       "dev.zio"   %% "zio-http"    % "3.11.6",
       "dev.zio"   %% "zio-json"    % "1.1.0",
       "org.xerial" % "sqlite-jdbc" % "3.53.4.0",
+      // zio-http declares Netty's io_uring transport optional; Main prefers it when the kernel supports it.
+      "io.netty"   % "netty-transport-native-io_uring" % nettyVersion classifier "linux-x86_64",
     ),
     // zio-http 3.11.6 was built against Netty 4.2.18; take the latest patch release.
     dependencyOverrides ++= Seq(
