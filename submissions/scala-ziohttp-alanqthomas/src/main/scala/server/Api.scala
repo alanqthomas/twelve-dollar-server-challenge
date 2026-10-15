@@ -13,9 +13,13 @@ import zio.json.ast.Json
 /**
  * The five endpoints.
  *
- * Every handler is a plain function `Request => Response`, so zio-http gets back an already-completed `Exit` and
- * writes the response straight from the Netty event loop: no fiber, no executor hop. SQLite calls run inline
- * on that thread; they are index lookups that take microseconds, and the box has a single vCPU anyway.
+ * Reads (`/health`, `/feed`, `/posts/:id`) and every rejected request are plain functions `Request => Response`:
+ * zio-http gets back an already-completed `Exit` and writes the response straight from the Netty event loop, with
+ * no fiber and no executor hop. SQLite reads run inline on that thread; they take microseconds, and the box has a
+ * single vCPU anyway.
+ *
+ * Accepted writes are validated on the event loop too, then handed to the [[Writer]] thread with `ZIO.async`: the
+ * response is completed from the writer once the write's transaction has committed.
  */
 final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
   import Api.*
@@ -25,14 +29,13 @@ final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
     Method.GET / "feed"                           -> Handler.fromFunction[Request](_ => guarded(feed())),
     Method.GET / "posts" / string("id")           -> Handler.fromFunction[(String, Request)]((id, _) => guarded(getPost(id))),
     Method.POST / "posts"                         -> Handler.fromFunctionZIO[Request](createPost),
-    Method.POST / "posts" / string("id") / "like" ->
-      Handler.fromFunction[(String, Request)]((id, req) => guarded(like(id, req))),
+    Method.POST / "posts" / string("id") / "like" -> Handler.fromFunctionZIO[(String, Request)]((id, req) => like(id, req)),
     RoutePattern.any                              -> Handler.fromFunction[(Path, Request)](_ => NotFound),
   )
 
   private def health(): Response =
     try
-      db.session().selectOne()
+      db.reader().selectOne()
       val uptime = (java.lang.System.nanoTime() - startedAtNanos) / 1_000_000_000L
       json(Status.Ok, s"""{"status":"ok","db":"ok","uptime_s":$uptime}""".getBytes(UTF_8))
     catch
@@ -41,14 +44,14 @@ final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
           .string(String.valueOf(e.getMessage)).byte('}')
         json(Status.ServiceUnavailable, body.toByteArray)
 
-  private def feed(): Response = json(Status.Ok, db.session().feedJson())
+  private def feed(): Response = json(Status.Ok, db.reader().feedJson())
 
   private def getPost(rawId: String): Response =
     val id = Ids.parsePositive(rawId)
     if id == Ids.Invalid then InvalidPostId
     else if id == Ids.Overflow then PostNotFound
     else
-      val body = db.session().postJson(id)
+      val body = db.reader().postJson(id)
       if body == null then PostNotFound else json(Status.Ok, body)
 
   private def createPost(req: Request): UIO[Response] =
@@ -56,13 +59,13 @@ final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
       jwt.authenticate(authorization(req)) match
         case Auth.User(userId, username) =>
           // An aggregated body is already in memory: `asArray` is a completed Exit, so this stays synchronous.
-          req.body.asArray.foldCause(_ => MalformedJson, bytes => guarded(createPost(userId, username, bytes)))
+          req.body.asArray.foldCauseZIO(_ => Exit.succeed(MalformedJson), bytes => createPost(userId, username, bytes))
         case failure                     => Exit.succeed(authError(failure))
     catch case NonFatal(_) => Exit.succeed(Internal)
 
-  private def createPost(userId: Long, username: String, bytes: Array[Byte]): Response =
+  private def createPost(userId: Long, username: String, bytes: Array[Byte]): UIO[Response] =
     Json.decoder.decodeJson(new String(bytes, UTF_8)) match
-      case Left(_)     => MalformedJson
+      case Left(_)     => Exit.succeed(MalformedJson)
       case Right(json) =>
         val raw = json match
           case obj: Json.Obj => Jwt.field(obj, "body")
@@ -70,30 +73,27 @@ final class Api(db: Db, jwt: Jwt, startedAtNanos: Long):
         raw match
           case Some(Json.Str(s)) =>
             val body = trimJs(s)
-            if body.isEmpty then BodyRequired
-            else if body.length > 500 then BodyTooLong
-            else Response(Status.Created, JsonHeaders, Body.fromArray(db.session().createPostJson(userId, username, body)))
-          case _                 => BodyRequired
+            if body.isEmpty then Exit.succeed(BodyRequired)
+            else if body.length > 500 then Exit.succeed(BodyTooLong)
+            else
+              ZIO.async[Any, Nothing, Response] { reply =>
+                db.writer.createPost(userId, body, result => reply(Exit.succeed(created(result, body, username))))
+              }
+          case _                 => Exit.succeed(BodyRequired)
 
-  private def like(rawId: String, req: Request): Response =
-    jwt.authenticate(authorization(req)) match // auth before the id, per the spec
-      case Auth.User(userId, _) =>
-        val postId = Ids.parsePositive(rawId)
-        if postId == Ids.Invalid then InvalidPostId
-        else if postId == Ids.Overflow then PostNotFound
-        else
-          db.session().like(userId, postId) match
-            case Db.Like.Inserted     => json(Status.Created, likeJson(postId, alreadyLiked = false))
-            case Db.Like.AlreadyLiked => json(Status.Ok, likeJson(postId, alreadyLiked = true))
-            case Db.Like.NoSuchPost   => PostNotFound
-      case failure              => authError(failure)
-
-  private def likeJson(postId: Long, alreadyLiked: Boolean): Array[Byte] =
-    db.session().out.reset()
-      .raw(LikedOpen).bool(alreadyLiked)
-      .raw(PostIdKey).long(postId)
-      .byte('}')
-      .toByteArray
+  private def like(rawId: String, req: Request): UIO[Response] =
+    try
+      jwt.authenticate(authorization(req)) match // auth before the id, per the spec
+        case Auth.User(userId, _) =>
+          val postId = Ids.parsePositive(rawId)
+          if postId == Ids.Invalid then Exit.succeed(InvalidPostId)
+          else if postId == Ids.Overflow then Exit.succeed(PostNotFound)
+          else
+            ZIO.async[Any, Nothing, Response] { reply =>
+              db.writer.like(userId, postId, result => reply(Exit.succeed(liked(result, postId))))
+            }
+        case failure              => Exit.succeed(authError(failure))
+    catch case NonFatal(_) => Exit.succeed(Internal)
 
 object Api:
   private val JsonHeaders = Headers(Header.Custom("content-type", "application/json"))
@@ -124,6 +124,18 @@ object Api:
 
   private val LikedOpen = JsonOut.ascii("""{"liked":true,"already_liked":""")
   private val PostIdKey = JsonOut.ascii(""","post_id":""")
+
+  private def created(result: WriteResult, body: String, username: String): Response = result match
+    case WriteResult.PostCreated(id, createdAt) =>
+      json(Status.Created, Db.createdPostJson(id, body, createdAt, username))
+    case _                                      => Internal
+
+  private def liked(result: WriteResult, postId: Long): Response = result match
+    case WriteResult.Liked(already) =>
+      val body = new JsonOut(64).raw(LikedOpen).bool(already).raw(PostIdKey).long(postId).byte('}').toByteArray
+      json(if already then Status.Ok else Status.Created, body)
+    case WriteResult.NoSuchPost     => PostNotFound
+    case _                          => Internal
 
   private def authorization(req: Request): String | Null =
     req.headers.rawHeaders(HttpHeaderNames.AUTHORIZATION) match

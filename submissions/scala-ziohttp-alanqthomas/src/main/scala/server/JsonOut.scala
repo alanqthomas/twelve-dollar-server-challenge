@@ -64,22 +64,32 @@ final class JsonOut(initialCapacity: Int):
 
   def string(s: String): JsonOut = string(s.getBytes(UTF_8))
 
+  def string(utf8: Array[Byte]): JsonOut = string(utf8, 0, utf8.length)
+
   /** Writes a JSON string from UTF-8 bytes, escaping `"`, `\` and control characters. */
-  def string(utf8: Array[Byte]): JsonOut =
-    ensure(utf8.length + 2)
+  def string(utf8: Array[Byte], from: Int, until: Int): JsonOut =
+    ensure(until - from + 2)
     buf(len) = '"'
     len += 1
-    var runStart = 0
-    var i        = 0
-    while i < utf8.length do
+    var runStart = from
+    var i        = from
+    while i < until do
       val b = utf8(i)
       if b == '"' || b == '\\' || (b >= 0 && b < 0x20) then
         copy(utf8, runStart, i - runStart)
         escape(b)
         runStart = i + 1
       i += 1
-    copy(utf8, runStart, utf8.length - runStart)
+    copy(utf8, runStart, until - runStart)
     byte('"')
+
+  private var scratch = new Array[Byte](1024)
+
+  /** Writes a JSON string from `length` UTF-8 bytes of native memory (a SQLite text column), escaping as above. */
+  def nativeString(address: Long, length: Int): JsonOut =
+    if length > scratch.length then scratch = new Array[Byte](math.max(length, scratch.length * 2))
+    server.sqlite.Sqlite.copy(address, scratch, 0, length)
+    string(scratch, 0, length)
 
   private def copy(src: Array[Byte], from: Int, n: Int): Unit =
     if n > 0 then

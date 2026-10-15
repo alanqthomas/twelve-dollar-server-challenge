@@ -1,60 +1,46 @@
 package server
 
-import java.sql.{Connection, PreparedStatement, ResultSet, SQLException}
-import java.util.concurrent.locks.ReentrantLock
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
+
+import scala.util.control.NonFatal
 
 import io.netty.util.concurrent.FastThreadLocal
-import org.sqlite.{SQLiteConfig, SQLiteOpenMode}
-import org.sqlite.core.{Codes, CoreStatement, SafeStmtPtr}
+import server.sqlite.{Sqlite, SqliteException}
 
 /**
- * SQLite access. Every thread that serves requests (the Netty event loop) gets its own connection with its
- * own prepared statements and JSON buffer, so reads never contend. Writes go through one JVM-wide lock so
- * two connections never race for SQLite's write lock (no SQLITE_BUSY, no busy-wait sleeps).
+ * SQLite, through the FFM binding in [[server.sqlite.Sqlite]] (a library compiled by build.sh).
  *
- * Every request runs its query against SQLite while it is being served (rule 5): statements are reused,
- * results never are.
+ * Reads run inline on the thread serving the request: every Netty event-loop thread gets its own connection,
+ * statements and JSON buffer, so reads never contend. Writes go to the single [[Writer]] thread, which commits
+ * them in batches. Every request reads its data from SQLite while it is being served (rule 5): statements are
+ * reused, results never are.
  */
-final class Db(path: String):
-  private val sessions = new FastThreadLocal[Db.Session]:
-    override def initialValue(): Db.Session = new Db.Session(Db.open(path, requestConnection = true))
+final class Db(path: String, settings: Db.Settings):
+  private val readers = new FastThreadLocal[Db.Reader]:
+    override def initialValue(): Db.Reader = new Db.Reader(Db.open(path, settings))
 
-  def session(): Db.Session = sessions.get()
+  def reader(): Db.Reader = readers.get()
+
+  val writer: Writer = new Writer(Db.open(path, settings), settings)
 
 object Db:
-  enum Like:
-    case Inserted, AlreadyLiked, NoSuchPost
+  /** Connection settings; mmap and the page cache are per connection. */
+  final case class Settings(mmapBytes: Long, cacheKiB: Int, checkpointEveryMillis: Long)
 
-  private val writeLock = new ReentrantLock()
-
-  def open(path: String, requestConnection: Boolean): Connection =
-    val cfg = new SQLiteConfig()
-    cfg.setJournalMode(SQLiteConfig.JournalMode.WAL)
-    cfg.setSynchronous(SQLiteConfig.SynchronousMode.NORMAL) // rule 6: WAL + NORMAL
-    cfg.setBusyTimeout(5000)
-    cfg.setTempStore(SQLiteConfig.TempStore.MEMORY)
-    cfg.setCacheSize(-16384)                                 // 16 MiB page cache
-    cfg.setOpenMode(SQLiteOpenMode.NOMUTEX)                  // each connection stays on one thread
-    val conn = cfg.createConnection(s"jdbc:sqlite:$path")
-    val st   = conn.createStatement()
-    try
-      st.execute("PRAGMA mmap_size = 1073741824") // read the database file through the OS page cache
-      // Commits never checkpoint inline (that fsyncs on the event loop); the background checkpointer in
-      // Main does it. The high limit is only a backstop should the checkpointer ever fall behind.
-      if requestConnection then st.execute("PRAGMA wal_autocheckpoint = 20000")
-    finally st.close()
-    conn
-
-  /** Copies committed WAL frames into the database file. Run off the event loop. */
-  def checkpoint(conn: Connection): Unit =
-    val st = conn.createStatement()
-    try st.execute("PRAGMA wal_checkpoint(PASSIVE)")
-    finally st.close()
-
-  private inline def locked[A](inline body: A): A =
-    writeLock.lock()
-    try body
-    finally writeLock.unlock()
+  def open(path: String, settings: Settings): Long =
+    val db = Sqlite.open(path, Sqlite.OPEN_READWRITE | Sqlite.OPEN_NOMUTEX | Sqlite.OPEN_EXRESCODE)
+    Sqlite.exec(db, "PRAGMA journal_mode = WAL")
+    Sqlite.exec(db, "PRAGMA synchronous = NORMAL") // rule 6: WAL + NORMAL
+    Sqlite.exec(db, "PRAGMA busy_timeout = 5000")
+    Sqlite.exec(db, "PRAGMA temp_store = MEMORY")
+    Sqlite.exec(db, s"PRAGMA cache_size = -${settings.cacheKiB}")
+    Sqlite.exec(db, s"PRAGMA mmap_size = ${settings.mmapBytes}")
+    // Commits never checkpoint: the writer does it between batches (see Writer).
+    Sqlite.exec(db, "PRAGMA wal_autocheckpoint = 0")
+    // Once a checkpoint lets the WAL restart, truncate a file that grew during a burst.
+    Sqlite.exec(db, "PRAGMA journal_size_limit = 16777216")
+    db
 
   private val PostColumns =
     """SELECT p.id, p.body, p.created_at, u.username,
@@ -81,103 +67,219 @@ object Db:
   private val LikesKey   = JsonOut.ascii(""","like_count":""")
   private val NoLikes    = JsonOut.ascii(""","like_count":0}}""")
 
-  /** One thread's connection, statements and response buffer. */
-  final class Session(conn: Connection):
-    val out: JsonOut                      = new JsonOut(16 * 1024)
-    private val ping: PreparedStatement   = conn.prepareStatement("SELECT 1")
-    private val feed: SafeStmtPtr         = conn.prepareStatement(FeedSql).asInstanceOf[CoreStatement].pointer
-    private val post: PreparedStatement   = conn.prepareStatement(PostSql)
-    private val insertPost                = conn.prepareStatement(InsertPostSql)
-    private val insertLike                = conn.prepareStatement(InsertLikeSql)
-    private val postExists                = conn.prepareStatement(PostExistsSql)
+  /** Steps a statement that returns no rows, then resets it. */
+  private[server] def run(db: Long, stmt: Long): Unit =
+    val rc = Sqlite.step(stmt)
+    Sqlite.reset(stmt)
+    if rc != Sqlite.DONE then throw new SqliteException(rc, Sqlite.errmsg(db))
+
+  /** One event-loop thread's connection, statements and response buffer. */
+  final class Reader(db: Long):
+    val out: JsonOut     = new JsonOut(16 * 1024)
+    private val ping     = Sqlite.prepare(db, "SELECT 1")
+    private val feed     = Sqlite.prepare(db, FeedSql)
+    private val post     = Sqlite.prepare(db, PostSql)
 
     def selectOne(): Unit =
-      val rs = ping.executeQuery()
-      try rs.next(): Unit
-      finally rs.close()
+      try
+        val rc = Sqlite.step(ping)
+        if rc != Sqlite.ROW then throw new SqliteException(rc, Sqlite.errmsg(db))
+      finally Sqlite.reset(ping)
 
-    /**
-     * `{"posts":[...]}` for the 20 newest posts.
-     *
-     * The hottest query, so it skips the JDBC ResultSet layer and steps the statement through sqlite-jdbc's
-     * public low-level API: one lock for the whole query instead of one per call, and no per-execution
-     * column-name lookups. That is ~12% less time per feed than `executeQuery` + `getBytes`.
-     */
+    /** `{"posts":[...]}` for the 20 newest posts. */
     def feedJson(): Array[Byte] =
       out.reset().raw(PostsOpen)
-      feed.safeRun[Unit, SQLException] { (db, stmt) =>
-        db.reset(stmt)
-        try
-          var rc    = db.step(stmt)
-          var first = true
-          while rc == Codes.SQLITE_ROW do
-            if !first then out.byte(',')
-            out
-              .raw(IdKey).long(db.column_long(stmt, 0))
-              .raw(BodyKey).string(db.column_blob(stmt, 1))
-              .raw(CreatedKey).string(db.column_blob(stmt, 2))
-              .raw(AuthorKey).string(db.column_blob(stmt, 3))
-              .raw(LikesKey).long(db.column_long(stmt, 4))
-              .byte('}')
-            first = false
-            rc = db.step(stmt)
-          if rc != Codes.SQLITE_DONE then throw new SQLException(s"feed query failed: SQLite code $rc")
-        finally db.reset(stmt): Unit // ends the read transaction
-      }
+      try
+        var rc    = Sqlite.step(feed)
+        var first = true
+        while rc == Sqlite.ROW do
+          if !first then out.byte(',')
+          writePost(feed)
+          first = false
+          rc = Sqlite.step(feed)
+        if rc != Sqlite.DONE then throw new SqliteException(rc, Sqlite.errmsg(db))
+      finally Sqlite.reset(feed) // ends the read transaction
       out.raw(PostsClose).toByteArray
 
     /** `{"post":{...}}`, or null when there is no such post. */
     def postJson(id: Long): Array[Byte] | Null =
-      post.setLong(1, id)
-      val rs = post.executeQuery()
+      Sqlite.bindLong(post, 1, id)
       try
-        if !rs.next() then null
-        else
+        val rc = Sqlite.step(post)
+        if rc == Sqlite.ROW then
           out.reset().raw(PostOpen)
-          writePost(rs)
+          writePost(post)
           out.byte('}').toByteArray
-      finally rs.close()
+        else if rc == Sqlite.DONE then null
+        else throw new SqliteException(rc, Sqlite.errmsg(db))
+      finally Sqlite.reset(post)
 
-    private def writePost(rs: ResultSet): Unit =
-      out
-        .raw(IdKey).long(rs.getLong(1))
-        .raw(BodyKey).string(rs.getBytes(2))
-        .raw(CreatedKey).string(rs.getBytes(3))
-        .raw(AuthorKey).string(rs.getBytes(4))
-        .raw(LikesKey).long(rs.getLong(5))
-        .byte('}')
+    private def writePost(stmt: Long): Unit =
+      out.raw(IdKey).long(Sqlite.columnLong(stmt, 0))
+      out.raw(BodyKey)
+      text(stmt, 1)
+      out.raw(CreatedKey)
+      text(stmt, 2)
+      out.raw(AuthorKey)
+      text(stmt, 3)
+      out.raw(LikesKey).long(Sqlite.columnLong(stmt, 4)).byte('}')
 
-    /** Inserts a post and returns its `{"post":{...}}` once the row is committed. */
-    def createPostJson(userId: Long, username: String, body: String): Array[Byte] =
-      val (id, createdAt) = locked {
-        insertPost.setLong(1, userId)
-        insertPost.setString(2, body)
-        val rs = insertPost.executeQuery()
-        try
-          if !rs.next() then throw new IllegalStateException("INSERT ... RETURNING returned no row")
-          val row = (rs.getLong(1), rs.getBytes(2))
-          // Step to SQLITE_DONE: that is when the autocommit transaction commits.
-          while rs.next() do ()
-          row
-        finally rs.close()
-      }
-      out.reset().raw(PostOpen)
-        .raw(IdKey).long(id)
-        .raw(BodyKey).string(body)
-        .raw(CreatedKey).string(createdAt)
-        .raw(AuthorKey).string(username)
-        .raw(NoLikes)
-        .toByteArray
+    private def text(stmt: Long, column: Int): Unit =
+      val address = Sqlite.columnText(stmt, column) // before columnBytes, as SQLite recommends
+      out.nativeString(address, Sqlite.columnBytes(stmt, column))
 
-    def like(userId: Long, postId: Long): Like =
-      val inserted = locked {
-        insertLike.setLong(1, userId)
-        insertLike.setLong(2, postId)
-        insertLike.executeUpdate() == 1 // autocommit: committed when this returns
-      }
-      if inserted then Like.Inserted
+  /** `{"post":{...}}` for a post that was just created (it has no likes yet). */
+  def createdPostJson(id: Long, body: String, createdAt: Array[Byte], username: String): Array[Byte] =
+    new JsonOut(1024).raw(PostOpen)
+      .raw(IdKey).long(id)
+      .raw(BodyKey).string(body.getBytes(UTF_8))
+      .raw(CreatedKey).string(createdAt)
+      .raw(AuthorKey).string(username)
+      .raw(NoLikes)
+      .toByteArray
+
+/** What a write did. Results are delivered only after the transaction holding the write has committed. */
+enum WriteResult:
+  case PostCreated(id: Long, createdAt: Array[Byte])
+  case Liked(alreadyLiked: Boolean)
+  case NoSuchPost
+  case Failed(error: Throwable)
+
+/**
+ * The only thread that writes (group commit, allowed by rule 6). Whatever writes are queued when it wakes up run
+ * in one `BEGIN IMMEDIATE … COMMIT`, and each caller hears back only after `COMMIT` returns: a 201 always means a
+ * committed row. One writer also means writes never wait on SQLite's write lock.
+ *
+ * Checkpoints run here too, between batches, so they never stall a request and the WAL stays small: while this
+ * thread checkpoints, nobody appends to the WAL, so the checkpoint can catch up with it completely and the next
+ * write restarts the log from the beginning. (A checkpointer on its own thread races the writes and can fall
+ * behind until the WAL is tens of MB.)
+ */
+final class Writer(db: Long, settings: Db.Settings):
+  import Writer.*
+
+  private val queue = new LinkedBlockingQueue[Op]()
+
+  /** Queues a new post; `done` runs on the writer thread once it is committed (or failed). */
+  def createPost(userId: Long, body: String, done: WriteResult => Unit): Unit =
+    queue.add(new CreatePost(userId, body.getBytes(UTF_8), done))
+
+  /** Queues a like; `done` runs on the writer thread once it is committed (or failed). */
+  def like(userId: Long, postId: Long, done: WriteResult => Unit): Unit =
+    queue.add(new Like(userId, postId, done))
+
+  private val begin      = Sqlite.prepare(db, "BEGIN IMMEDIATE")
+  private val commit     = Sqlite.prepare(db, "COMMIT")
+  private val rollback   = Sqlite.prepare(db, "ROLLBACK")
+  private val insertPost = Sqlite.prepare(db, Db.InsertPostSql)
+  private val insertLike = Sqlite.prepare(db, Db.InsertLikeSql)
+  private val postExists = Sqlite.prepare(db, Db.PostExistsSql)
+  /** Native memory a post body is copied into for binding (SQLITE_STATIC: it must outlive the statement's step). */
+  private val bodyBuffer = java.lang.foreign.Arena.global().allocate(MaxBodyBytes.toLong)
+
+  @volatile private var running = true
+  private val thread            = Thread.ofPlatform().name("sqlite-writer").daemon(true).unstarted(() => loop())
+
+  def start(): Unit = thread.start()
+
+  def stop(): Unit =
+    running = false
+    thread.interrupt()
+    thread.join(5000)
+
+  private def loop(): Unit =
+    val batch          = new java.util.ArrayList[Op](MaxBatch)
+    val results        = new Array[WriteResult](MaxBatch)
+    var lastCheckpoint = System.nanoTime()
+    while running do
+      try
+        val first = queue.poll(250, TimeUnit.MILLISECONDS)
+        if first != null then
+          batch.add(first)
+          queue.drainTo(batch, MaxBatch - 1)
+          commitBatch(batch, results)
+          batch.clear()
+        if System.nanoTime() - lastCheckpoint >= settings.checkpointEveryMillis * 1_000_000L then
+          checkpoint()
+          lastCheckpoint = System.nanoTime()
+      catch
+        case _: InterruptedException => ()
+        case NonFatal(e)             => System.err.println(s"sqlite-writer: ${e.getMessage}")
+    var op = queue.poll()
+    while op != null do // shutting down: anything left gets an error instead of waiting forever
+      op.done(WriteResult.Failed(new IllegalStateException("shutting down")))
+      op = queue.poll()
+
+  private def commitBatch(batch: java.util.ArrayList[Op], results: Array[WriteResult]): Unit =
+    val n = batch.size
+    try
+      Db.run(db, begin)
+      var i = 0
+      while i < n do
+        results(i) =
+          try execute(batch.get(i))
+          catch case NonFatal(e) => WriteResult.Failed(e)
+        i += 1
+      Db.run(db, commit)
+    catch
+      case NonFatal(e) => // nothing in this batch is committed
+        try Db.run(db, rollback)
+        catch case NonFatal(_) => ()
+        java.util.Arrays.fill(results.asInstanceOf[Array[AnyRef]], 0, n, WriteResult.Failed(e))
+    var i = 0
+    while i < n do
+      val result = results(i)
+      results(i) = null
+      try batch.get(i).done(result)
+      catch case NonFatal(e) => System.err.println(s"sqlite-writer: callback failed: ${e.getMessage}")
+      i += 1
+
+  private def execute(op: Op): WriteResult = op match
+    case p: CreatePost =>
+      if p.body.length > MaxBodyBytes then throw new IllegalArgumentException("body too large")
+      Sqlite.copy(p.body, 0, bodyBuffer.address(), p.body.length)
+      Sqlite.bindLong(insertPost, 1, p.userId)
+      Sqlite.bindText(insertPost, 2, bodyBuffer.address(), p.body.length)
+      try
+        val rc = Sqlite.step(insertPost)
+        if rc != Sqlite.ROW then throw new SqliteException(rc, Sqlite.errmsg(db))
+        val id        = Sqlite.columnLong(insertPost, 0)
+        val address   = Sqlite.columnText(insertPost, 1)
+        val createdAt = new Array[Byte](Sqlite.columnBytes(insertPost, 1))
+        Sqlite.copy(address, createdAt, 0, createdAt.length)
+        val end = Sqlite.step(insertPost) // RETURNING: the insert finishes on the step after its row
+        if end != Sqlite.DONE then throw new SqliteException(end, Sqlite.errmsg(db))
+        WriteResult.PostCreated(id, createdAt)
+      finally Sqlite.reset(insertPost)
+
+    case l: Like =>
+      Sqlite.bindLong(insertLike, 1, l.userId)
+      Sqlite.bindLong(insertLike, 2, l.postId)
+      Db.run(db, insertLike)
+      if Sqlite.changes(db) == 1 then WriteResult.Liked(alreadyLiked = false)
       else
-        postExists.setLong(1, postId)
-        val rs = postExists.executeQuery()
-        try if rs.next() then Like.AlreadyLiked else Like.NoSuchPost
-        finally rs.close()
+        Sqlite.bindLong(postExists, 1, l.postId)
+        try
+          Sqlite.step(postExists) match
+            case Sqlite.ROW  => WriteResult.Liked(alreadyLiked = true)
+            case Sqlite.DONE => WriteResult.NoSuchPost
+            case rc          => throw new SqliteException(rc, Sqlite.errmsg(db))
+        finally Sqlite.reset(postExists)
+
+  private var lastWarning = 0L
+
+  private def checkpoint(): Unit =
+    val Array(walFrames, checkpointed) = Sqlite.checkpoint(db, Sqlite.CHECKPOINT_PASSIVE)
+    // A WAL that keeps growing means checkpoints can't catch up (readers holding old snapshots): say so, rarely.
+    if walFrames > LargeWalFrames && System.nanoTime() - lastWarning > 30_000_000_000L then
+      lastWarning = System.nanoTime()
+      System.err.println(s"sqlite-writer: WAL at $walFrames frames, $checkpointed checkpointed")
+
+object Writer:
+  private val MaxBatch       = 1024
+  private val MaxBodyBytes   = 64 * 1024
+  private val LargeWalFrames = 10_000
+
+  private sealed abstract class Op(val done: WriteResult => Unit)
+  private final class CreatePost(val userId: Long, val body: Array[Byte], done: WriteResult => Unit) extends Op(done)
+  private final class Like(val userId: Long, val postId: Long, done: WriteResult => Unit)            extends Op(done)

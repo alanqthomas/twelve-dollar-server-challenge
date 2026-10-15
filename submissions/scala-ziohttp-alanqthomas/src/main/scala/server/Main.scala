@@ -27,21 +27,29 @@ object Main extends ZIOAppDefault:
       else if io.netty.channel.epoll.Epoll.isAvailable then ChannelType.EPOLL
       else ChannelType.NIO
 
-  /** Moves WAL checkpoints (and their fsyncs) off the event loop: one PASSIVE checkpoint per second. */
-  private def checkpointer(path: String): RIO[Scope, Unit] =
-    ZIO
-      .acquireRelease(ZIO.attemptBlocking(Db.open(path, requestConnection = false)))(c => ZIO.succeed(c.close()))
-      .flatMap(conn => ZIO.attemptBlocking(Db.checkpoint(conn)).ignoreLogged.repeat(Schedule.spaced(1.second)))
-      .unit
+  /**
+   * SQLite settings (system properties, for experiments). No mmap by default: the database file grows as posts and
+   * likes are written, and every growth past the mapped size makes SQLite remap the file and fault pages back in.
+   */
+  private val dbSettings = Db.Settings(
+    mmapBytes = sys.props.get("server.mmapBytes").map(_.toLong).getOrElse(0L),
+    cacheKiB = sys.props.get("server.cacheKiB").map(_.toInt).getOrElse(65536),
+    checkpointEveryMillis = sys.props.get("server.checkpointMillis").map(_.toLong).getOrElse(1000L),
+  )
 
-  override def run: ZIO[Any, Throwable, Unit] =
+  /** The writer thread lives as long as the server: started before it, stopped (after its last batch) after it. */
+  private def writer(db: Db): URIO[Scope, Unit] =
+    ZIO.acquireRelease(ZIO.succeed(db.writer.start()))(_ => ZIO.attemptBlocking(db.writer.stop()).orDie)
+
+  override def run: ZIO[Any, Throwable, Unit] = ZIO.scoped:
     for
       path   <- env("SQLITE_PATH")
       secret <- env("JWT_SECRET")
       host   <- env("HOST").orElseSucceed("127.0.0.1")
       port   <- env("PORT").map(_.toInt).orElseSucceed(3000)
-      api     = new Api(new Db(path), new Jwt(secret.getBytes(UTF_8)), java.lang.System.nanoTime())
-      _      <- ZIO.scoped(checkpointer(path)).forkDaemon
+      db     <- ZIO.attempt(new Db(path, dbSettings))
+      _      <- writer(db)
+      api     = new Api(db, new Jwt(secret.getBytes(UTF_8)), java.lang.System.nanoTime())
       config  = Server.Config.default
                   .binding(host, port)
                   .keepAlive(true)                  // and no idle timeout: keep-alive connections stay open
@@ -54,7 +62,8 @@ object Main extends ZIOAppDefault:
                   .channelType(transport)
                   .bossGroup(NettyConfig.default.bossGroup.copy(channelType = transport))
                   .leakDetection(LeakDetectionLevel.DISABLED)
-      _      <- ZIO.logInfo(s"listening on $host:$port ($transport, $ioThreads event-loop thread(s)), database $path")
+      _      <- ZIO.logInfo(s"listening on $host:$port ($transport, $ioThreads event-loop thread(s)), database $path, " +
+                  s"SQLite ${server.sqlite.Sqlite.version()}, $dbSettings")
       _      <- Server
                   .serve(api.routes)
                   .provide(ZLayer.succeed(config), ZLayer.succeed(netty), Server.customized)

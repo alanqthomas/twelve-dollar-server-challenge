@@ -1,4 +1,5 @@
 // The $12 Server Challenge: Scala 3 + ZIO + zio-http on SQLite. `sbt assembly` -> target/server.jar
+// SQLite itself is a C library build.sh compiles (target/libsqlite3.so), called through src/main/java/server/sqlite.
 val nettyVersion = "4.2.19.Final"
 
 lazy val root = (project in file("."))
@@ -10,9 +11,8 @@ lazy val root = (project in file("."))
       "dev.zio"   %% "zio"         % "2.1.27",
       "dev.zio"   %% "zio-http"    % "3.11.6",
       "dev.zio"   %% "zio-json"    % "1.1.0",
-      "org.xerial" % "sqlite-jdbc" % "3.53.4.0",
       // zio-http declares Netty's io_uring transport optional; Main prefers it when the kernel supports it.
-      "io.netty"   % "netty-transport-native-io_uring" % nettyVersion classifier "linux-x86_64",
+      ("io.netty"  % "netty-transport-native-io_uring" % nettyVersion).classifier("linux-x86_64"),
     ),
     // zio-http 3.11.6 was built against ZIO 2.1.26 and Netty 4.2.18; keep every module on the latest patch release.
     dependencyOverrides += "dev.zio" %% "zio-streams" % "2.1.27",
