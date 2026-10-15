@@ -14,6 +14,8 @@ SQLITE_FLAGS=(
   -DSQLITE_DEFAULT_MEMSTATUS=0        # no global mutex and counters around every allocation
   -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1  # synchronous=NORMAL in WAL mode (the app sets it as well)
   -DSQLITE_DQS=0
+  -DSQLITE_ENABLE_QPSG                # plans never depend on bound values, so rebinding (a new post id) never
+                                      # forces a full re-prepare: without it, every GET /posts/:id re-parsed its SQL
   -DSQLITE_LIKE_DOESNT_MATCH_BLOBS
   -DSQLITE_MAX_EXPR_DEPTH=0
   -DSQLITE_OMIT_AUTOINIT              # the app calls sqlite3_initialize itself

@@ -43,11 +43,13 @@ thread as a scoped resource.
 - **SQLite through FFM, built for this app.** `build.sh` compiles the amalgamation with SQLite's recommended
   options for an app whose connections each stay on one thread: `SQLITE_THREADSAFE=2` (no per-connection mutex),
   `SQLITE_DEFAULT_MEMSTATUS=0` (no global mutex around every allocation), `OMIT_SHARED_CACHE`,
-  `OMIT_DEPRECATED`, `DQS=0` and so on. The binding is a small Java class, so every downcall handle is a
+  `OMIT_DEPRECATED`, `DQS=0` and so on. `SQLITE_ENABLE_QPSG` keeps query plans independent of bound values:
+  without it, binding a new id to the single-post statement made SQLite re-parse and re-plan it on every
+  `GET /posts/:id` (11% of the event loop's CPU in a profile). The binding is a small Java class, so every downcall handle is a
   `static final` the JIT inlines. Pointers travel as raw `long`s, and the short calls (`bind`, `column`, `reset`,
   `changes`) are critical downcalls that skip the thread-state transition. Text columns are copied from SQLite's
   memory straight into the response buffer. Against sqlite-jdbc (whose glue was ~13% of the event loop's CPU in
-  a profile), server CPU per request fell ~10% under the same load.
+  a profile), server CPU per request fell ~19% under the same load, QPSG included.
 - **Group commit on one writer thread (rule 6).** Whatever writes are queued when the writer wakes up run in one
   `BEGIN IMMEDIATE … COMMIT`, and each caller hears back only after `COMMIT` returns, so a 201 always means a
   committed row. One writer also means writes never wait on SQLite's write lock, and the event loop never waits
@@ -63,8 +65,9 @@ thread as a scoped resource.
   CPU per request than reads through a 64 MiB page cache per connection.
 - **The feed query.** It is the reference SQL. I benchmarked a correlated subquery for the username, a CTE, a
   derived table, and `LEFT JOIN ... GROUP BY`. None beat it, and the `GROUP BY` version was 2.5x slower.
-  Building the whole JSON in SQLite with `json_group_array(json_object(...))` was no faster than building it in
-  the app.
+  Building the whole JSON in SQLite with `json_group_array(json_object(...))` gives identical bytes, but through
+  the FFM binding it was 15% slower for the feed (12.1 µs against 10.5 µs) and no faster for a single post: column
+  reads cost nanoseconds here, and SQLite's JSON functions add a string buffer per object plus another copy.
 - **io_uring.** Netty's io_uring transport batches the reads and writes of many connections into one
   `io_uring_enter`. On one core, under a many-connections load, it held ~8% more requests per second than epoll
   at saturation, with lower tail latency. If the kernel refuses io_uring, the server falls back to epoll, then NIO.
@@ -106,8 +109,9 @@ seconds, and p99 crossed 1 s. So the limit is CPU per request, which is what the
 | Version | Server CPU per request | p99 | Largest WAL |
 |---|---|---|---|
 | Previous (sqlite-jdbc, background checkpointer) | 21 µs | 1.28 ms | 17 MB |
-| **This one (FFM, group commit, no mmap)** | **19 µs** | **0.99 ms** | **9 MB** |
-| This one with a 1 GiB `mmap_size` | 22 µs | 1.71 ms | 9 MB |
+| **This one (FFM, group commit, QPSG, no mmap)** | **17 µs** | **0.72 ms** | **9 MB** |
+| This one without QPSG | 19 µs | 0.99 ms | 9 MB |
+| This one without QPSG, with a 1 GiB `mmap_size` | 22 µs | 1.71 ms | 9 MB |
 
 ## License
 
