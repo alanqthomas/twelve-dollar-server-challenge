@@ -26,7 +26,7 @@ final class Db(path: String, settings: Db.Settings):
 
 object Db:
   /** Connection settings; mmap and the page cache are per connection. */
-  final case class Settings(mmapBytes: Long, cacheKiB: Int, checkpointEveryMillis: Long)
+  final case class Settings(mmapBytes: Long, cacheKiB: Int, checkpointEveryMillis: Long, batchWindowMillis: Long)
 
   def open(path: String, settings: Settings): Long =
     val db = Sqlite.open(path, Sqlite.OPEN_READWRITE | Sqlite.OPEN_NOMUTEX | Sqlite.OPEN_EXRESCODE)
@@ -196,6 +196,10 @@ final class Writer(db: Long, settings: Db.Settings):
         val first = queue.poll(250, TimeUnit.MILLISECONDS)
         if first != null then
           batch.add(first)
+          // Let more writes join this commit: every commit by this connection makes the readers drop their page
+          // caches at their next read, so fewer, larger commits keep those caches warm.
+          if settings.batchWindowMillis > 0 then
+            java.util.concurrent.locks.LockSupport.parkNanos(settings.batchWindowMillis * 1_000_000L)
           queue.drainTo(batch, MaxBatch - 1)
           commitBatch(batch, results)
           batch.clear()

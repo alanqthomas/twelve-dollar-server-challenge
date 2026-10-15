@@ -35,7 +35,16 @@ object Main extends ZIOAppDefault:
     mmapBytes = sys.props.get("server.mmapBytes").map(_.toLong).getOrElse(0L),
     cacheKiB = sys.props.get("server.cacheKiB").map(_.toInt).getOrElse(65536),
     checkpointEveryMillis = sys.props.get("server.checkpointMillis").map(_.toLong).getOrElse(1000L),
+    batchWindowMillis = sys.props.get("server.batchWindowMillis").map(_.toLong).getOrElse(0L),
   )
+
+  /**
+   * Netty logs a warning with a stack trace whenever a response is written to a connection the client already
+   * closed (a client that gave up waiting). Under overload that is thousands of lines a minute on the one core that
+   * should be catching up, so only severe pipeline errors are logged. (A strong reference: JUL loggers are weak.)
+   */
+  private val pipelineLogger = java.util.logging.Logger.getLogger("io.netty.channel.DefaultChannelPipeline")
+  pipelineLogger.setLevel(java.util.logging.Level.SEVERE)
 
   /** The writer thread lives as long as the server: started before it, stopped (after its last batch) after it. */
   private def writer(db: Db): URIO[Scope, Unit] =

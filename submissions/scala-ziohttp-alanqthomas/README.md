@@ -71,6 +71,11 @@ thread as a scoped resource.
 - **io_uring.** Netty's io_uring transport batches the reads and writes of many connections into one
   `io_uring_enter`. On one core, under a many-connections load, it held ~8% more requests per second than epoll
   at saturation, with lower tail latency. If the kernel refuses io_uring, the server falls back to epoll, then NIO.
+  The completion queue stays at Netty's 4,096 entries: on a droplet at 30,000 users, a 65,536-entry queue tripled
+  the event loop's kernel time inside `io_uring_enter` and the server fell over, though it measured fine locally.
+- **Quiet about clients that gave up.** Netty logs a stack trace for every response written to a connection the
+  client already closed. Under overload that was thousands of lines a minute on the one core trying to catch up,
+  so only severe pipeline errors are logged.
 - **Direct, not Nginx.** On one vCPU, Nginx's CPU comes straight out of the app's budget. Nginx's
   `worker_connections 16384` also caps a run at about 16k users. Netty holds idle keep-alive connections cheaply,
   and there is no idle timeout, so connections stay open as long as the client wants.
